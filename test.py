@@ -1,32 +1,36 @@
 import sympy as sp
 import networkx as nx
 
-G = nx.MultiGraph() #Q:应该不要用有向图吧
-edge_map = {}
 
+def build_circuit_graph(components):
+    """
+    根据元件列表构建电路图。
+    参数 components 格式: [(node1, node2, type, value), ...]
+    返回: G (MultiGraph), edge_map (dict)
+    """
+    G = nx.MultiGraph()
+    edge_map = {}
+    
+    # 遍历列表并添加边
+    for i, (u, v, tp, val) in enumerate(components):
+        tp = tp.upper()#兼容小写字母
+        wt = 1 if tp == 'C' else 2
+        #连支中尽量多C就是生成树尽量少C, 所以C的wt应该是1, 其它的是2
+        G.add_edge(u, v, key=i, type=tp, value=val, weight=wt)
+        edge_map[i] = (u, v, i)
+    
+    return G, edge_map
 
-# automatically restore the id for future reference
-def add_edge_with_id(G, u, v, edge_id, **attr):
-    G.add_edge(u, v, key=edge_id, **attr)
-    edge_map[edge_id] = (u, v, edge_id)
-    return edge_id
+my_components = [
+    (0, 1, 'JJ', 0.5),   
+    (1, 2, 'L', 10e-3),  
+    (2, 0, 'C', 0.5),   
+    (1, 0, 'C', 2e-6),   
+]
 
+G, edge_map = build_circuit_graph(my_components)
 
-n = int(input()) # number of nodes
-G.add_nodes_from(range(0, n)) # node "n - 1" is by default the ground node
+T = nx.minimum_spanning_tree(G, weight='weight')
 
-m = int(input()) # number of edges
-for i in range(0, m):
-    n1 = int(input())
-    n2 = int(input())
-    tp = str(input()) # L, C, JJ
-    val = float(input())
-    if(tp == C):
-        wt = 2
-    else:
-        wt = 1
-    add_edge_with_id(G, n1, n2, i, type = tp, value = val, weight = wt) # directed from n1 to n2
+print(f"生成树支路 ID: {[key for u, v, key in T.edges(keys=True)]}")
 
-
-# construct the spanning tree
-T = nx.minimum_spanning_tree(G, weight = 'weight')
