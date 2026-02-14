@@ -1,3 +1,8 @@
+'''边的正方向定义为从小号节点指向大号节点'''
+
+
+
+
 import sympy as sp
 import networkx as nx
 
@@ -117,9 +122,10 @@ def build_circuit_graph(components: list[Component], mutuals: None | list[Mutual
     for u, v, old_key, data in tree_edges:
         G_new.add_edge(u, v, key=new_key, **data)
         old_to_new_key[old_key] = new_key
+        mi, ma = (u, v) if u < v else (v, u)
         new_edge_map[new_key] = {
-            'u': u,
-            'v': v,
+            'u': mi,
+            'v': ma,
             'type': data['type'],
             'value': data['value']
         }
@@ -129,9 +135,10 @@ def build_circuit_graph(components: list[Component], mutuals: None | list[Mutual
     for u, v, old_key, data in non_tree_edges:
         G_new.add_edge(u, v, key=new_key, **data)
         old_to_new_key[old_key] = new_key
+        mi, ma = (u, v) if u < v else (v, u)
         new_edge_map[new_key] = {
-            'u': u,
-            'v': v,
+            'u': mi,
+            'v': ma,
             'type': data['type'],
             'value': data['value']
         }
@@ -154,6 +161,64 @@ def build_circuit_graph(components: list[Component], mutuals: None | list[Mutual
         new_mutual_dict[coupling_key] = value
 
     return T_new, G_new, new_edge_map, new_mutual_dict
+
+
+
+def fundamental_loop_matrix(T, G, edge_map):
+    """
+    构建基本回路矩阵，所有边的参考方向均为小节点→大节点。
+    返回:
+        B_f: 列表的列表，大小为 (连支数) × (总支路数)
+        loop_fluxes: 每个回路的磁通量符号（sympy Symbol）
+    """
+    m = G.number_of_edges()
+    nt = T.number_of_edges()
+    # 构建树的无向图（用于路径查找）
+    tree_graph = nx.Graph()
+    # 树边信息字典：键为排序后的节点对，值为 (key, u, v) 其中 u<v
+    tree_edge_info = {}
+    for u, v, key in T.edges(keys=True):
+        # 确保 u<v（已在构建 T 时保证）
+        tree_graph.add_edge(u, v)
+        a, b = (u, v) if u < v else (v, u)   # a<v
+        tree_edge_info[(a, b)] = (key, u, v)
+
+    n_loops = m - nt
+    B_f = [[0] * m for _ in range(n_loops)]
+    loop_fluxes = []
+
+    loop_idx = 0
+    for key in range(nt, m):  # 连支
+        info = edge_map[key]
+        u, v = info['u'], info['v']   # 已保证 u<v
+        B_f[loop_idx][key] = 1        # 连支方向为正（小→大）
+
+        # 在树中找 u 到 v 的路径
+        path_nodes = nx.shortest_path(tree_graph, source=v, target=u)
+        for i in range(len(path_nodes) - 1):
+            a, b = path_nodes[i], path_nodes[i+1]
+            # 获取树边key'
+            key_a, key_b = (a, b) if a < b else (b, a)
+            t_key, t_u, t_v = tree_edge_info[(key_a, key_b)]
+            # 确定符号：如果路径方向 a->b 与边的参考方向 t_u->t_v 一致，则 +1，否则 -1
+            if a < b:
+                sign = 1
+            else:
+                sign = -1
+            B_f[loop_idx][t_key] += sign
+
+        # 用户输入磁通量符号
+        flux_str = input(f"请输入回路 {loop_idx} (对应连支 key={key}) 的磁通量符号: ").strip()
+        if flux_str == "":
+            flux_sym = sp.symbols(f'Phi_{loop_idx}')
+        else:
+            flux_sym = sp.symbols(flux_str)
+        loop_fluxes.append(flux_sym)
+
+        loop_idx += 1
+
+    return B_f, loop_fluxes
+
 
 
 # ------------------ 测试 ------------------
@@ -179,5 +244,18 @@ if __name__ == "__main__":
     print("新的mutual_dict（新key对 -> 互感值）：", mutual_dict)
 
     # 输出边数统计
+    print(f"\n树T的边数: {T.number_of_edges()}")
+    print(f"全图G的边数: {G.number_of_edges()}")
+    
+    
+    # 构建基本回路矩阵
+    print("\n开始构建基本回路矩阵...")
+    B_f, loop_fluxes = fundamental_loop_matrix(T, G, edge_map)
+
+    print("\n基本回路矩阵 B_f：")
+    for row in B_f:
+        print(row)
+    print("回路磁通量符号：", loop_fluxes)
+
     print(f"\n树T的边数: {T.number_of_edges()}")
     print(f"全图G的边数: {G.number_of_edges()}")
