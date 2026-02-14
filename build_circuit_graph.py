@@ -1,4 +1,4 @@
-'''边的正方向定义为从小号节点指向大号节点'''
+'''边的正方向定义为从小号节点指向大号节点,无视输入的顺序'''
 
 
 
@@ -208,9 +208,9 @@ def fundamental_loop_matrix(T, G, edge_map):
             B_f[loop_idx][t_key] += sign
 
         # 用户输入磁通量符号
-        flux_str = input(f"请输入回路 {loop_idx} (对应连支 key={key}) 的磁通量符号: ").strip()
+        flux_str = input(f"请输入回路 {loop_idx + nt} (对应连支 key={key}) 的磁通量符号: ").strip()
         if flux_str == "":
-            flux_sym = sp.symbols(f'Phi_{loop_idx}')
+            flux_sym = sp.symbols(f'Phi_{loop_idx + nt}')
         else:
             flux_sym = sp.symbols(flux_str)
         loop_fluxes.append(flux_sym)
@@ -218,6 +218,72 @@ def fundamental_loop_matrix(T, G, edge_map):
         loop_idx += 1
 
     return B_f, loop_fluxes
+
+
+def fundamental_cut_matrix(T, G, edge_map):
+    """
+    构建基本割集矩阵，所有边的参考方向均为小节点→大节点。
+    每个割集对应于一条树支，方向与该树支的方向一致（小→大）。
+
+    返回:
+        Q_f: 列表的列表，大小为 (树支数) × (总支路数)
+    """
+    m = G.number_of_edges()
+    nt = T.number_of_edges()
+    # 构建树的无向图（用于分割）
+    tree_graph = nx.Graph()
+    # 记录每条树支的信息：键为排序后的节点对，值为 key
+    tree_edge_dict = {}
+    for u, v, key in T.edges(keys=True):
+        tree_graph.add_edge(u, v)
+        a, b = (u, v) if u < v else (v, u)
+        tree_edge_dict[(a, b)] = key
+
+    # 初始化割集矩阵，行：树支，列：所有支路
+    Q_f = [[0] * m for _ in range(nt)]
+
+    # 对每条树支构造基本割集
+    for row_key in range(nt):
+        # 找到该树支对应的边信息
+        # 由于树支 key 从 0 到 nt-1，可以直接从 T 中获取？
+        # 但需要知道它的两个端点。由于 T 是 MultiGraph，我们可以遍历找到 key 对应的边。
+        # 更可靠：根据 key 从 T 的边数据中获取
+        u = v = None
+        for uu, vv, kk in T.edges(keys=True):
+            if kk == row_key:
+                u, v = uu, vv
+                break
+        if u is None:
+            raise ValueError(f"树中找不到 key={row_key} 的边")
+        # 确保 u < v（T 中应该已保证）
+        if u > v:
+            u, v = v, u
+
+        # 在树中移除该边，得到两个连通分量
+        # 复制树图，移除该边
+        tree_graph_copy = tree_graph.copy()
+        tree_graph_copy.remove_edge(u, v)
+        # 获取包含 u 的节点集合（通过 BFS/DFS）
+        comp_u = set(nx.node_connected_component(tree_graph_copy, u))
+        comp_v = set(tree_graph.nodes) - comp_u  # 另一个分量
+
+        # 树支自身
+        Q_f[row_key][row_key] = 1
+
+        # 遍历所有连支（key >= nt）
+        for col_key in range(nt, m):
+            info = edge_map[col_key]
+            a, b = info['u'], info['v']  # a < b
+            # 判断连支的两个端点是否分别位于两个不同分量
+            if (a in comp_u and b in comp_v):
+                # 方向一致：连支的小节点在 u 侧，大节点在 v 侧
+                Q_f[row_key][col_key] = 1
+            elif (a in comp_v and b in comp_u):
+                # 方向相反：连支的小节点在 v 侧，大节点在 u 侧
+                Q_f[row_key][col_key] = -1
+            # 否则不在割集中，保持 0
+
+    return Q_f
 
 
 
@@ -250,12 +316,21 @@ if __name__ == "__main__":
     
     # 构建基本回路矩阵
     print("\n开始构建基本回路矩阵...")
-    B_f, loop_fluxes = fundamental_loop_matrix(T, G, edge_map)
+    FLM, loop_fluxes = fundamental_loop_matrix(T, G, edge_map)
 
-    print("\n基本回路矩阵 B_f：")
-    for row in B_f:
+    print("\n基本回路矩阵 FLM：")
+    for row in FLM:
         print(row)
     print("回路磁通量符号：", loop_fluxes)
+    
+    
+    print("\n开始构建基本割集矩阵...")
+    FCM = fundamental_cut_matrix(T, G, edge_map)
+
+    print("\n基本割集矩阵 FCM：")
+    for row in FCM:
+        print(row)
+    
 
     print(f"\n树T的边数: {T.number_of_edges()}")
     print(f"全图G的边数: {G.number_of_edges()}")
