@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(cd D:\\\\BaiduSyncdisk\\\\vsCOde\\\\circuit:*)",
-      "Bash(\"D:\\\\BaiduSyncdisk\\\\vsCOde\\\\circuit/.venv/Scripts/pip.exe\" install:*)"
-    ]
-  }
-}
