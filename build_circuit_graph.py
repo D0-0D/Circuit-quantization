@@ -449,7 +449,8 @@ class Circuit:
         return H_total, info
 
 
-# ==================== 主程序 (演示新的使用流程) ====================
+
+'''
 if __name__ == "__main__":
 
     # ---- 第 1 步: 定义元件并创建电路 ----
@@ -505,3 +506,4 @@ if __name__ == "__main__":
 
     print(f"\n哈密顿量 H:")
     sp.pprint(sp.expand(H))
+'''
