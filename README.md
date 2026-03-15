@@ -100,8 +100,7 @@ circuit.remove_physical_flux(0) # 删除磁通
 
 ```
 Circuit-quantization/
-├── build_circuit_graph_rebuild.py  # 核心引擎（当前版本）
-├── build_circuit_graph.py          # 旧版（已过时）
+├── build_circuit_graph_rebuild.py  # 核心引擎
 ├── test_rebuild.ipynb              # 使用示例与测试
 ├── requirements.txt                # Python 依赖
 └── README.md
