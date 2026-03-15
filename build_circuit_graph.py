@@ -17,8 +17,7 @@ class Component:
             self.value = value
     @property
     def weight(self):
-        # 电容优先进入生成树 (权重小)
-        return 1 if self.type == 'C' else (2 if self.type == 'JJ' else 3)
+        return 2 if self.type == 'C' else 1 if self.type == 'L' else 0
 
 class MutualInductance:
     '''定义互感系数'''
@@ -507,3 +506,6 @@ if __name__ == "__main__":
     print(f"\n哈密顿量 H:")
     sp.pprint(sp.expand(H))
 '''
+
+# Numpy版本
+# 用户如何确定磁通正方向, 希望和用户手上的电路图一致(外加磁通破坏了对称性)
