@@ -87,7 +87,7 @@ class Circuit:
             self._rebuild()
             self._dirty = False
 
-    # ==================== 元件管理 ====================
+    # 元件管理 
 
     def add_component(self, u: int, v: int, tp: str, value) -> int:
         '''
@@ -118,7 +118,7 @@ class Circuit:
             del self._mutuals[k]
         self._mark_dirty()
 
-    # ==================== 互感管理 ====================
+    # 互感管理 
 
     def add_mutual(self, comp_id1: int, comp_id2: int, value) -> int:
         '''
@@ -132,6 +132,9 @@ class Circuit:
         '''
         if comp_id1 not in self._components or comp_id2 not in self._components:
             raise KeyError("互感引用的元件不存在")
+        for cid in (comp_id1, comp_id2):
+            if self._components[cid].type != 'L':
+                raise TypeError(f"元件 {cid} 不是电感（type='{self._components[cid].type}'），互感只能施加在电感之间")
         mutual_id = self._next_mutual_id
         self._next_mutual_id += 1
         self._mutuals[mutual_id] = MutualInductance(comp_id1, comp_id2, value)
@@ -145,11 +148,40 @@ class Circuit:
         del self._mutuals[mutual_id]
         self._mark_dirty()
 
-    # ==================== 物理磁通管理 ====================
+    # 物理磁通管理
+
+    @staticmethod
+    def _normalize_comp_loop(comp_loop):
+        '''
+        标准化元件回路: 返回 (canonical_tuple, direction)
+
+        canonical_tuple: 规范化的元件 ID 元组 (所有旋转/反转中字典序最小的)
+        direction: +1 (同向) 或 -1 (反向, 即原始回路与规范形式方向相反)
+        '''
+        n = len(comp_loop)
+        if n == 2:
+            a, b = comp_loop
+            if a <= b:
+                return (a, b), 1
+            else:
+                return (b, a), -1
+
+        best = None
+        best_dir = 1
+        for i in range(n):
+            fwd = tuple(comp_loop[(i + j) % n] for j in range(n))
+            if best is None or fwd < best:
+                best = fwd
+                best_dir = 1
+            bwd = tuple(comp_loop[(i - j) % n] for j in range(n))
+            if bwd < best:
+                best = bwd
+                best_dir = -1
+        return best, best_dir
 
     def add_physical_flux(self, comp_loop: list[int], flux) -> int:
         '''
-        添加物理外磁通
+        添加物理外磁通 (相同物理回路自动合并)
 
         参数:
             comp_loop: 围成物理孔洞的元件 ID 列表 (按顺序排列)
@@ -157,11 +189,40 @@ class Circuit:
                        元件首尾相连形成闭合回路
             flux: 磁通值 (字符串自动转为 sympy 符号, 0 表示无磁通)
 
-        返回: 磁通 ID
+        返回: 磁通 ID (若合并到已有条目, 返回已有 ID)
         '''
+        flux_val = sp.symbols(flux) if isinstance(flux, str) else flux
+
+        # 校验: 元件不可重复
+        if len(comp_loop) != len(set(comp_loop)):
+            seen = set()
+            dupes = [c for c in comp_loop if c in seen or seen.add(c)]
+            raise ValueError(f"物理回路中元件不可重复, 重复的元件 ID: {dupes}")
+
+        # 校验: 节点不可重复 (不可经过同一节点两次)
+        if len(comp_loop) >= 2:
+            dirs = self._trace_comp_loop_directions(comp_loop)
+            if dirs is None:
+                raise ValueError("物理回路元件不首尾相连或无法构成闭合回路")
+            visited_nodes = [d[0] for d in dirs]  # 每条边的起始节点
+            if len(visited_nodes) != len(set(visited_nodes)):
+                seen = set()
+                dupes = [n for n in visited_nodes if n in seen or seen.add(n)]
+                raise ValueError(f"物理回路经过了重复节点: {dupes}")
+
+        canonical, direction = self._normalize_comp_loop(comp_loop)
+        canonical_flux = direction * flux_val  # 转换到规范方向
+
+        # 检查是否已有相同物理回路, 若有则合并
+        for fid, pf in self._physical_fluxes.items():
+            if tuple(pf.comp_loop) == canonical:
+                pf.flux = sp.nsimplify(pf.flux + canonical_flux)
+                return fid
+
+        # 新回路: 以规范形式存储
         flux_id = self._next_flux_id
         self._next_flux_id += 1
-        self._physical_fluxes[flux_id] = PhysicalFlux(comp_loop, flux)
+        self._physical_fluxes[flux_id] = PhysicalFlux(list(canonical), canonical_flux)
         return flux_id
 
     def remove_physical_flux(self, flux_id: int):
@@ -170,7 +231,7 @@ class Circuit:
             raise KeyError(f"物理磁通 {flux_id} 不存在")
         del self._physical_fluxes[flux_id]
 
-    # ==================== 内部: 图构建 ====================
+    # 图构建 
 
     def _rebuild(self):
         '''重新构建电路图、生成树、基本回路'''
@@ -275,7 +336,7 @@ class Circuit:
         self._loops = loops
         self._comp_to_edge = comp_to_edge
 
-    # ==================== 内部: 物理磁通分解 ====================
+    #  物理磁通分解 
 
     def _physical_loop_to_signed_vector(self, phys_flux: PhysicalFlux) -> list:
         '''
@@ -312,8 +373,8 @@ class Circuit:
                 f"与元件 {comp_loop[1]} ({edge_infos[1]['u']}-{edge_infos[1]['v']}) 不相邻"
             )
 
-        # 从第一条边的非共享端点出发
-        shared_node = shared.pop()
+        # 从第一条边的非共享端点出发 (取 min 保证确定性)
+        shared_node = min(shared)
         start_node = (e0_nodes - {shared_node}).pop()
 
         # 追踪路径, 构建有符号边向量
@@ -367,7 +428,7 @@ class Circuit:
 
         return external_fluxes
 
-    # ==================== 内部: 基本割集矩阵 ====================
+    #  基本割集矩阵 
 
     def _compute_fundamental_cut_matrix(self):
         '''计算基本割集矩阵 Q_f, 行对应树枝编号'''
@@ -400,7 +461,7 @@ class Circuit:
 
         return sp.Matrix(Q_list)
 
-    # ==================== 内部: 参数矩阵 ====================
+    #  参数矩阵 
 
     def _build_parameter_matrices(self):
         '''构建 D_C (电容), L_plus (电感逆), D_J (约瑟夫森) 矩阵'''
@@ -456,7 +517,7 @@ class Circuit:
 
         return D_C, L_plus, D_J
 
-    # ==================== 公开属性 ====================
+    # 公开属性 
 
     @property
     def nt(self):
@@ -506,7 +567,7 @@ class Circuit:
         '''当前物理磁通字典 {flux_id: PhysicalFlux}'''
         return dict(self._physical_fluxes)
 
-    # ==================== 打印信息 ====================
+    # 打印信息 
 
     def print_components(self):
         '''打印所有元件'''
@@ -575,6 +636,43 @@ class Circuit:
                     print(f"  磁通来源: {', '.join(sources)}")
             print()
 
+    def _trace_comp_loop_directions(self, comp_loop):
+        '''追踪元件回路中每个元件的遍历方向, 返回 [(from_node, to_node), ...]'''
+        n = len(comp_loop)
+        if n < 2:
+            return None
+
+        comps = []
+        for cid in comp_loop:
+            if cid not in self._components:
+                return None
+            comps.append(self._components[cid])
+
+        e0_nodes = {comps[0].u, comps[0].v}
+        e1_nodes = {comps[1].u, comps[1].v}
+        shared = e0_nodes & e1_nodes
+        if not shared:
+            return None
+
+        shared_node = min(shared)
+        start_node = (e0_nodes - {shared_node}).pop()
+
+        directions = []
+        current = start_node
+        for comp in comps:
+            if current == comp.u:
+                directions.append((comp.u, comp.v))
+                current = comp.v
+            elif current == comp.v:
+                directions.append((comp.v, comp.u))
+                current = comp.u
+            else:
+                return None
+
+        if current != start_node:
+            return None
+        return directions
+
     def print_physical_fluxes(self):
         '''打印所有物理磁通的设置'''
         if not self._physical_fluxes:
@@ -584,18 +682,27 @@ class Circuit:
         print(f"共 {len(self._physical_fluxes)} 个物理磁通:")
         for fid, pf in self._physical_fluxes.items():
             comp_str = ' -> '.join(str(c) for c in pf.comp_loop)
-            details = []
-            for cid in pf.comp_loop:
-                if cid in self._components:
+            # 追踪遍历方向
+            dirs = self._trace_comp_loop_directions(pf.comp_loop)
+            if dirs:
+                details = []
+                for cid, (fn, tn) in zip(pf.comp_loop, dirs):
                     comp = self._components[cid]
-                    details.append(f"{comp.type}({comp.u}-{comp.v})")
-                else:
-                    details.append("[已删除]")
-            detail_str = ' -> '.join(details)
+                    details.append(f"{comp.type}({fn}→{tn})")
+                detail_str = ' -> '.join(details)
+            else:
+                details = []
+                for cid in pf.comp_loop:
+                    if cid in self._components:
+                        comp = self._components[cid]
+                        details.append(f"{comp.type}({comp.u}-{comp.v})")
+                    else:
+                        details.append("[已删除]")
+                detail_str = ' -> '.join(details)
             print(f"  磁通 {fid}: Φ = {pf.flux}")
             print(f"    回路元件: [{comp_str}] = {detail_str}")
 
-    # ==================== 哈密顿量 ====================
+    # 哈密顿量 
 
     def hamiltonian(self):
         '''
@@ -682,66 +789,3 @@ class Circuit:
         return H_total, info
 
 
-# ==================== 测试示例 ====================
-
-if __name__ == "__main__":
-
-    # ---- 创建空电路, 逐步添加元件 ----
-    circuit = Circuit()
-
-    jj1 = circuit.add_component(0, 2, 'JJ', 'EJ1')
-    jj2 = circuit.add_component(1, 2, 'JJ', 'EJ2')
-    L   = circuit.add_component(0, 1, 'L',  'L')
-    C1  = circuit.add_component(0, 2, 'C',  'C1')
-    C2  = circuit.add_component(1, 2, 'C',  'C2')
-
-    print("=" * 50)
-    print("元件列表:")
-    print("=" * 50)
-    circuit.print_components()
-
-    print()
-    print("=" * 50)
-    print("重排后的边信息:")
-    print("=" * 50)
-    circuit.print_edges()
-
-    print()
-    print("=" * 50)
-    print("基本回路 (无外磁通):")
-    print("=" * 50)
-    circuit.print_loops()
-
-    # ---- 添加物理外磁通 ----
-    # 物理孔洞由 JJ1, L, JJ2 围成, 加外磁通 Phi_e
-    fid = circuit.add_physical_flux(comp_loop=[jj1, L, jj2], flux='Phi_e')
-
-    print("=" * 50)
-    print("设置物理磁通后:")
-    print("=" * 50)
-    circuit.print_physical_fluxes()
-    print()
-    circuit.print_loops()
-
-    # ---- 计算哈密顿量 ----
-    print("=" * 50)
-    print("基本割集矩阵 F_C:")
-    print("=" * 50)
-    sp.pprint(circuit.F_C)
-
-    H, info = circuit.hamiltonian()
-
-    print(f"\n广义坐标 (树枝磁通):")
-    sp.pprint(info['phi_t'])
-
-    print(f"\n外磁通变量:")
-    if info['ext_fluxes']:
-        sp.pprint(info['ext_fluxes'])
-    else:
-        print("无")
-
-    print(f"\n全支路磁通 Phi_vec:")
-    sp.pprint(info['Phi_vec'])
-
-    print(f"\n哈密顿量 H:")
-    sp.pprint(sp.expand(H))
