@@ -1,6 +1,4 @@
 sympy
 networkx
 numpy
-streamlit
-pandas
 matplotlib

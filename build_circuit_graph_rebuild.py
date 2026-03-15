@@ -14,7 +14,7 @@ class Component:
 
     @property
     def weight(self):
-        '''生成树权重 (最小权重优先进入树枝)'''
+        '''生成树权重: JJ=0 < L=1 < C=2, 最小权重优先进入树枝 (电容倾向连支)'''
         return 2 if self.type == 'C' else 1 if self.type == 'L' else 0
 
 
@@ -263,38 +263,28 @@ class Circuit:
         edge_map = {}
         comp_to_edge = {}
 
+        def register_edges(items, graph, start_key):
+            '''将一组元件注册为图的边, 返回下一个可用 key'''
+            key = start_key
+            for item in items:
+                comp = item['comp']
+                graph.add_edge(comp.u, comp.v, key=key,
+                               type=comp.type, value=comp.value)
+                edge_map[key] = {
+                    'u': comp.u, 'v': comp.v,
+                    'type': comp.type, 'value': comp.value,
+                    'comp_id': item['comp_id'],
+                }
+                comp_to_edge[item['comp_id']] = key
+                key += 1
+            return key
+
         T_new = nx.MultiGraph()
         T_new.add_nodes_from(G_orig.nodes)
-        current_key = 0
-
-        for item in tree_items:
-            comp = item['comp']
-            T_new.add_edge(comp.u, comp.v, key=current_key,
-                           type=comp.type, value=comp.value)
-            edge_map[current_key] = {
-                'u': comp.u, 'v': comp.v,
-                'type': comp.type, 'value': comp.value,
-                'comp_id': item['comp_id'],
-            }
-            comp_to_edge[item['comp_id']] = current_key
-            current_key += 1
-
-        nt = current_key
+        nt = register_edges(tree_items, T_new, 0)
 
         G_new = T_new.copy()
-        for item in chord_items:
-            comp = item['comp']
-            G_new.add_edge(comp.u, comp.v, key=current_key,
-                           type=comp.type, value=comp.value)
-            edge_map[current_key] = {
-                'u': comp.u, 'v': comp.v,
-                'type': comp.type, 'value': comp.value,
-                'comp_id': item['comp_id'],
-            }
-            comp_to_edge[item['comp_id']] = current_key
-            current_key += 1
-
-        m = current_key
+        m = register_edges(chord_items, G_new, nt)
 
         # 5. 互感映射
         mutual_dict = {}
@@ -342,66 +332,19 @@ class Circuit:
         '''
         将物理回路 (元件 ID 序列) 转换为有符号边向量
 
-        算法:
-            1. 根据元件顺序追踪节点路径
-            2. 每条边按遍历方向标记 +1 (u→v) 或 -1 (v→u)
-
-        约定: 边 k 的正方向为 u→v (u < v)
+        复用 _trace_comp_loop_directions 追踪节点路径,
+        再根据遍历方向标记 +1 (u→v) 或 -1 (v→u)
         '''
         comp_loop = phys_flux.comp_loop
-        m = self._m
+        dirs = self._trace_comp_loop_directions(comp_loop)
+        if dirs is None:
+            raise ValueError("物理回路无法构成闭合回路")
 
-        for cid in comp_loop:
-            if cid not in self._comp_to_edge:
-                raise KeyError(f"物理回路引用的元件 {cid} 不存在或已被删除")
-
-        edge_keys = [self._comp_to_edge[cid] for cid in comp_loop]
-        edge_infos = [self._edge_map[ek] for ek in edge_keys]
-        n = len(comp_loop)
-
-        if n < 2:
-            raise ValueError("物理回路至少需要 2 个元件")
-
-        # 找第一条边和第二条边的共享节点, 确定起始方向
-        e0_nodes = {edge_infos[0]['u'], edge_infos[0]['v']}
-        e1_nodes = {edge_infos[1]['u'], edge_infos[1]['v']}
-        shared = e0_nodes & e1_nodes
-
-        if not shared:
-            raise ValueError(
-                f"元件 {comp_loop[0]} ({edge_infos[0]['u']}-{edge_infos[0]['v']}) "
-                f"与元件 {comp_loop[1]} ({edge_infos[1]['u']}-{edge_infos[1]['v']}) 不相邻"
-            )
-
-        # 从第一条边的非共享端点出发 (取 min 保证确定性)
-        shared_node = min(shared)
-        start_node = (e0_nodes - {shared_node}).pop()
-
-        # 追踪路径, 构建有符号边向量
-        p = [0] * m
-        current_node = start_node
-
-        for i in range(n):
-            ek = edge_keys[i]
-            ei = edge_infos[i]
-            u, v = ei['u'], ei['v']
-
-            if current_node == u:
-                p[ek] = 1        # 正方向 u→v
-                current_node = v
-            elif current_node == v:
-                p[ek] = -1       # 反方向 v→u
-                current_node = u
-            else:
-                raise ValueError(
-                    f"元件 {comp_loop[i]} 与路径不连续 "
-                    f"(当前节点 {current_node}, 元件端点 {u}-{v})"
-                )
-
-        if current_node != start_node:
-            raise ValueError(
-                f"物理回路未闭合: 起点 {start_node}, 终点 {current_node}")
-
+        p = [0] * self._m
+        for cid, (from_n, _) in zip(comp_loop, dirs):
+            ek = self._comp_to_edge[cid]
+            ei = self._edge_map[ek]
+            p[ek] = 1 if from_n == ei['u'] else -1
         return p
 
     def _compute_external_fluxes(self) -> dict:
@@ -506,9 +449,8 @@ class Circuit:
 
             try:
                 Gamma_sub = L_sub.inv()
-            except:
-                print("警告：电感矩阵奇异，可能包含无电感回路或未定义的互感。")
-                Gamma_sub = sp.zeros(n_L, n_L)
+            except (ValueError, sp.matrices.common.NonInvertibleMatrixError):
+                raise ValueError("电感矩阵奇异，无法求逆。请检查互感参数或电路拓扑。")
 
             L_plus = sp.zeros(num_edges, num_edges)
             for i in range(n_L):
@@ -612,15 +554,25 @@ class Circuit:
             flux = external_fluxes.get(chord_key, 0)
 
             print(f"回路 {i}: (由连支 Key {chord_key} 闭合)")
+            # 回路正方向: 连支 u→v (+1), 然后树枝从 v 沿树回到 u
             print(f"  连支: {chord['type']} ({chord['u']}->{chord['v']}), "
-                  f"值: {chord['value']} [元件ID: {chord['comp_id']}]")
-            path_str = ' -> '.join(map(str, loop['path_nodes']))
-            print(f"  回路路径: {path_str} -> {loop['path_nodes'][0]}")
+                  f"值: {chord['value']} [元件ID: {chord['comp_id']}], "
+                  f"遍历: {chord['u']}→{chord['v']} (+1)")
+            # 树枝路径: 反转 path_nodes (原 path 是 u→v, 正方向树枝部分是 v→u)
+            tree_path = list(reversed(loop['path_nodes']))
+            tree_keys = list(reversed(loop['tree_branch_keys']))
+            full_path = [chord['u']] + tree_path
+            path_str = ' -> '.join(map(str, full_path))
+            print(f"  回路路径: {path_str}")
             print(f"  包含树枝:")
-            for bk in loop['tree_branch_keys']:
+            for j, bk in enumerate(tree_keys):
                 info = self._edge_map[bk]
+                fn = tree_path[j]
+                tn = tree_path[j + 1]
+                sign = "+1" if fn == info['u'] else "-1"
                 print(f"    Key {bk}: {info['type']} ({info['u']}->{info['v']}), "
-                      f"值: {info['value']} [元件ID: {info['comp_id']}]")
+                      f"值: {info['value']} [元件ID: {info['comp_id']}], "
+                      f"遍历: {fn}→{tn} ({sign})")
 
             # 显示外磁通及其来源
             print(f"  外磁通: {flux}")
@@ -654,8 +606,12 @@ class Circuit:
         if not shared:
             return None
 
-        shared_node = min(shared)
-        start_node = (e0_nodes - {shared_node}).pop()
+        if len(shared) == 2:
+            # 两元件并联 (共享两个节点): 按第一个元件的正方向 (u→v) 遍历
+            start_node = comps[0].u
+        else:
+            shared_node = shared.pop()
+            start_node = (e0_nodes - {shared_node}).pop()
 
         directions = []
         current = start_node
@@ -756,10 +712,9 @@ class Circuit:
         M = F_C * D_C * F_C.T
         try:
             M_inv = M.inv()
-            H_kin = (sp.Rational(1, 2) * q_t.T * M_inv * q_t)[0]
-        except:
-            M_inv_sym = sp.Symbol("M^{-1}")
-            H_kin = (sp.Rational(1, 2) * q_t.T * M_inv_sym * q_t)[0]
+        except (ValueError, sp.matrices.common.NonInvertibleMatrixError):
+            raise ValueError("质量矩阵 M = F_C·D_C·F_C^T 奇异，无法求逆。请检查电容参数。")
+        H_kin = (sp.Rational(1, 2) * q_t.T * M_inv * q_t)[0]
 
         # 5. 电感势能: H_L = ½ Phi^T L_plus Phi
         H_mag_lin = (sp.Rational(1, 2) * Phi_vec.T * L_plus * Phi_vec)[0]

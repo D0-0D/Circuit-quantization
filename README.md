@@ -6,11 +6,11 @@
 
 - 支持电容 (C)、电感 (L)、约瑟夫逊结 (JJ) 三类元件
 - 支持电感间的**互感耦合**
-- 自动选择最小权重生成树（电容优先进入树枝）
+- 自动选择最小权重生成树（JJ/L 优先进入树枝，电容倾向连支）
 - 计算基本割集矩阵 $Q_f$
-- 为每个基本回路分配外磁通
+- 通过**物理回路**绑定外磁通，支持多磁通自动叠加
 - 符号推导完整哈密顿量：动能（电场能）+ 电感势能 + 约瑟夫逊势能
-- 提供 Streamlit Web 界面，支持交互式编辑和可视化
+- 支持 Jupyter Notebook 交互式使用
 
 ## 快速开始
 
@@ -20,36 +20,31 @@
 pip install -r requirements.txt
 ```
 
-### 启动 Web 界面
-
-```bash
-streamlit run app.py
-```
-
 ### 作为 Python 模块使用
 
 ```python
-from build_circuit_graph import Component, Circuit, MutualInductance
+from build_circuit_graph_rebuild import Circuit
 
-# 定义元件
-components = [
-    Component(0, 2, 'JJ', 'EJ1'),
-    Component(1, 2, 'JJ', 'EJ2'),
-    Component(0, 1, 'L',  'L'),
-    Component(0, 2, 'C',  'C1'),
-    Component(1, 2, 'C',  'C2'),
-]
+# 创建空电路
+circuit = Circuit()
 
-# 创建电路
-circuit = Circuit(components)
+# 添加元件，返回元件 ID
+cj1 = circuit.add_component(0, 2, 'JJ', 'EJ1')
+cj2 = circuit.add_component(1, 2, 'JJ', 'EJ2')
+cl  = circuit.add_component(0, 1, 'L',  'L')
+cc1 = circuit.add_component(0, 2, 'C',  'C1')
+cc2 = circuit.add_component(1, 2, 'C',  'C2')
+
+# 添加互感（只能施加在电感之间）
+mid = circuit.add_mutual(cl, cl, 'M')  # 示例：同一电感自耦合
+
+# 添加物理外磁通（元件 ID 列表按顺序围成回路）
+circuit.add_physical_flux([cj1, cl, cj2], 'Phi_e')
 
 # 查看信息
 circuit.print_edges()
 circuit.print_loops()
-
-# 设置外磁通
-circuit.set_external_flux(0, 'Phi_e')
-circuit.set_external_flux(1, 0)
+circuit.print_physical_fluxes()
 
 # 计算哈密顿量
 H, info = circuit.hamiltonian()
@@ -61,40 +56,61 @@ H, info = circuit.hamiltonian()
 
 | 类型 | 说明 | 生成树权重 |
 |------|------|-----------|
-| `C`  | 电容 | 1（优先进入树枝） |
-| `JJ` | 约瑟夫逊结 | 2 |
-| `L`  | 电感 | 3 |
+| `JJ` | 约瑟夫逊结 | 0（最优先进入树枝） |
+| `L`  | 电感 | 1 |
+| `C`  | 电容 | 2（倾向连支） |
 
 ### 约定
 
 - **接地节点**：编号最大的节点为接地节点
 - **边方向**：始终从小编号节点指向大编号节点
 - **参数值**：支持符号字符串（如 `'EJ1'`）或数值
+- **元件 ID**：`add_component` 返回的整数 ID，用于后续引用（互感、磁通、删除）
 
 ### 互感
 
-定义互感时，`L1_id` 和 `L2_id` 对应元件在输入列表中的索引（从 0 开始）：
+通过元件 ID 添加互感，只能施加在电感 (`L`) 之间：
 
 ```python
-mutuals = [
-    MutualInductance(L1_id=2, L2_id=5, value='M12'),
-]
-circuit = Circuit(components, mutuals)
+cl1 = circuit.add_component(0, 1, 'L', 'L1')
+cl2 = circuit.add_component(1, 2, 'L', 'L2')
+circuit.add_mutual(cl1, cl2, 'M12')
+```
+
+### 物理外磁通
+
+通过元件 ID 列表指定物理回路，顺序决定磁通正方向（右手定则）。相同物理回路的磁通自动合并：
+
+```python
+# 元件 ID 按顺序围成闭合回路
+circuit.add_physical_flux([cj1, cl, cj2], 'Phi_e')
+```
+
+### 动态修改
+
+元件、互感、磁通均可随时增删，图结构按需自动重建：
+
+```python
+circuit.remove_component(cc1)   # 删除元件（关联互感一并删除）
+circuit.remove_mutual(mid)      # 删除互感
+circuit.remove_physical_flux(0) # 删除磁通
 ```
 
 ## 项目结构
 
 ```
 Circuit-quantization/
-├── build_circuit_graph.py   # 核心引擎：图构建、生成树、割集矩阵、哈密顿量推导
-├── app.py                   # Streamlit Web 界面
-├── requirements.txt         # Python 依赖
+├── build_circuit_graph_rebuild.py  # 核心引擎（当前版本）
+├── build_circuit_graph.py          # 旧版（已过时）
+├── test_rebuild.ipynb              # 使用示例与测试
+├── requirements.txt                # Python 依赖
 └── README.md
 ```
 
 ## 算法流程
 
-1. **构建电路图** — 将元件列表构建为 NetworkX 多重图，计算最小权重生成树，对所有支路重新编号（树枝 `0..nt-1`，连支 `nt..m-1`）
+1. **构建电路图** — 将元件构建为 NetworkX 多重图，计算最小权重生成树，对所有支路重新编号（树枝 `0..nt-1`，连支 `nt..m-1`）
 2. **基本割集矩阵** — 对每个树枝，移除后找连通分量，确定哪些连支穿越割集，构建 $Q_f$ 矩阵
 3. **参数矩阵** — 构建电容矩阵 $D_C$、电感逆矩阵 $L^+$（含互感）、约瑟夫逊矩阵 $D_J$
-4. **哈密顿量** — 动能 $\frac{1}{2} q^T M^{-1} q$ + 电感势能 $\frac{1}{2} \Phi^T L^+ \Phi$ + 约瑟夫逊势能 $-\sum E_J \cos(\Phi_k)$
+4. **外磁通分解** — 将物理回路投影到基本回路空间，计算各基本回路的外磁通分量
+5. **哈密顿量** — 动能 $\frac{1}{2} q^T M^{-1} q$ + 电感势能 $\frac{1}{2} \Phi^T L^+ \Phi$ + 约瑟夫逊势能 $-\sum E_J \cos(\Phi_k)$
