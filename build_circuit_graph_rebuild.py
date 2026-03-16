@@ -45,11 +45,18 @@ class Circuit:
         1. 创建空电路:      circuit = Circuit()
         2. 添加元件:        cid = circuit.add_component(u, v, type, value)
         3. 添加互感 (可选): mid = circuit.add_mutual(cid1, cid2, value)
-        4. 添加物理磁通:    fid = circuit.add_physical_flux(comp_loop, flux)
+        4. 添加物理磁通:    必须提供恰好 num_loops 个线性无关的物理回路
+                            fid = circuit.add_physical_flux(comp_loop, flux)
+                            磁通为 0 的回路也需添加: add_physical_flux(..., 0)
         5. 查看信息:        circuit.print_edges() / circuit.print_loops()
         6. 计算哈密顿量:    H, info = circuit.hamiltonian()
 
     元件/互感/磁通可随时增删, 所有计算按需自动重建图结构
+
+    外磁通计算原理:
+        每个物理回路可分解为基本回路的线性组合, 系数由回路在各连支上的分量决定。
+        将所有物理回路排成矩阵方程 A · φ_ext = b, 解出各基本回路的外磁通。
+        要求物理回路数 = 基本回路数 (连支数), 且矩阵 A 可逆 (回路线性无关)。
     '''
 
     def __init__(self):
@@ -179,7 +186,7 @@ class Circuit:
                 best_dir = -1
         return best, best_dir
 
-    def add_physical_flux(self, comp_loop: list[int], flux) -> int:
+    def add_physical_flux(self, comp_loop: list[int], flux, direction: int = None) -> int:
         '''
         添加物理外磁通 (相同物理回路自动合并)
 
@@ -188,9 +195,22 @@ class Circuit:
                        顺序决定磁通正方向 (右手定则)
                        元件首尾相连形成闭合回路
             flux: 磁通值 (字符串自动转为 sympy 符号, 0 表示无磁通)
+            direction: 仅在两元件回路时可用, 取值 +1 或 -1。
+                       +1 (默认) 表示该回路的正方向为第一个元件从小序号节点到大序号节点;
+                       -1 表示第一个元件从大序号节点到小序号节点 (即整个回路反向)。
+                       若回路恰好由两个元件组成且未指定此参数, 将发出警告并默认使用 +1。
 
         返回: 磁通 ID (若合并到已有条目, 返回已有 ID)
         '''
+        import warnings
+
+        # 校验 direction 参数合法性
+        if direction is not None:
+            if direction not in (1, -1):
+                raise ValueError(f"direction 参数必须为 +1 或 -1，当前值: {direction}")
+            if len(comp_loop) != 2:
+                raise ValueError("direction 参数仅适用于两元件回路")
+
         flux_val = sp.symbols(flux) if isinstance(flux, str) else flux
 
         # 校验: 元件不可重复
@@ -210,8 +230,19 @@ class Circuit:
                 dupes = [n for n in visited_nodes if n in seen or seen.add(n)]
                 raise ValueError(f"物理回路经过了重复节点: {dupes}")
 
-        canonical, direction = self._normalize_comp_loop(comp_loop)
-        canonical_flux = direction * flux_val  # 转换到规范方向
+            # 两元件回路: 方向不确定时发出警告并默认 +1
+            if len(comp_loop) == 2 and direction is None:
+                warnings.warn(
+                    "两元件物理回路方向不确定，已默认为 +1 方向"
+                    "（第一个元件从小序号节点到大序号节点）。"
+                    "如需明确指定方向，请传入 direction=1 或 direction=-1。",
+                    UserWarning, stacklevel=2
+                )
+                direction = 1
+
+        user_dir = direction if direction is not None else 1
+        canonical, norm_dir = self._normalize_comp_loop(comp_loop)
+        canonical_flux = norm_dir * user_dir * flux_val  # 转换到规范方向
 
         # 检查是否已有相同物理回路, 若有则合并
         for fid, pf in self._physical_fluxes.items():
@@ -349,27 +380,58 @@ class Circuit:
 
     def _compute_external_fluxes(self) -> dict:
         '''
-        从所有物理磁通计算各基本回路的外磁通
+        从所有物理磁通解出各基本回路的外磁通
 
         原理:
-            任何回路 p 都可以唯一分解为基本回路的线性组合
-            分解系数 c_i = p 在连支 k_i 上的分量 (±1 或 0)
-            这是因为基本回路矩阵在连支列构成单位阵
+            每个物理回路 p 可分解为基本回路的线性组合: p = Σ c_i ℓ_i
+            其中 c_i = p 在连支 i 上的分量 (±1 或 0)
+            物理回路 p 的总磁通 Φ_p = Σ c_i · φ_ext_i
+
+            将所有物理回路排成矩阵方程: A · φ_ext = b
+            其中 A[p, i] = c_i (物理回路 p 在连支 i 上的分量)
+                 b[p] = Φ_p (物理回路 p 的磁通)
+
+            要求用户提供恰好 num_loops 个线性无关的物理回路 (含磁通为 0 的),
+            使得 A 为方阵且可逆, 从而唯一解出 φ_ext = A⁻¹ · b
         '''
-        external_fluxes = {}
-        for loop in self._loops:
-            external_fluxes[loop['chord_key']] = 0
+        num_chords = self._m - self._nt
 
-        for phys_flux in self._physical_fluxes.values():
-            p = self._physical_loop_to_signed_vector(phys_flux)
+        if num_chords == 0:
+            return {}
 
-            for loop in self._loops:
-                chord_key = loop['chord_key']
-                coeff = p[chord_key]
-                if coeff != 0:
-                    external_fluxes[chord_key] += coeff * phys_flux.flux
+        phys_list = list(self._physical_fluxes.values())
+        num_phys = len(phys_list)
 
-        return external_fluxes
+        if num_phys != num_chords:
+            raise ValueError(
+                f"需要恰好 {num_chords} 个线性无关的物理回路来确定外磁通，"
+                f"当前已提供 {num_phys} 个。"
+                f"即使磁通为 0 的回路也必须添加 (使用 add_physical_flux(..., 0))。"
+            )
+
+        chord_keys = [loop['chord_key'] for loop in self._loops]
+
+        # 构建分解矩阵 A 和磁通向量 b
+        A = sp.zeros(num_phys, num_chords)
+        b = sp.zeros(num_phys, 1)
+
+        for i, pf in enumerate(phys_list):
+            p = self._physical_loop_to_signed_vector(pf)
+            for j, ck in enumerate(chord_keys):
+                A[i, j] = p[ck]
+            b[i] = pf.flux
+
+        # 检查物理回路是否线性无关
+        if A.rank() < num_chords:
+            raise ValueError(
+                "提供的物理回路线性相关，无法唯一确定各基本回路的外磁通。"
+                "请确保每个物理回路对应不同的独立孔洞。"
+            )
+
+        # 解线性方程组: A · φ_ext = b
+        x = A.LUsolve(b)
+
+        return {ck: sp.nsimplify(x[j]) for j, ck in enumerate(chord_keys)}
 
     #  基本割集矩阵 
 
@@ -449,7 +511,7 @@ class Circuit:
 
             try:
                 Gamma_sub = L_sub.inv()
-            except (ValueError, sp.matrices.common.NonInvertibleMatrixError):
+            except ValueError:
                 raise ValueError("电感矩阵奇异，无法求逆。请检查互感参数或电路拓扑。")
 
             L_plus = sp.zeros(num_edges, num_edges)
@@ -534,7 +596,13 @@ class Circuit:
     def print_loops(self):
         '''打印所有基本回路信息及当前外磁通'''
         self._ensure_built()
-        external_fluxes = self._compute_external_fluxes()
+        try:
+            external_fluxes = self._compute_external_fluxes()
+            flux_ready = True
+        except ValueError as e:
+            external_fluxes = {loop['chord_key']: 0 for loop in self._loops}
+            flux_ready = False
+            flux_err_msg = str(e)
 
         # 预计算物理回路的有符号边向量 (用于显示磁通来源)
         phys_vectors = {}
@@ -575,18 +643,24 @@ class Circuit:
                       f"遍历: {fn}→{tn} ({sign})")
 
             # 显示外磁通及其来源
-            print(f"  外磁通: {flux}")
-            if phys_vectors:
-                sources = []
-                for fid, pvec in phys_vectors.items():
-                    coeff = pvec[chord_key]
-                    if coeff != 0:
-                        pf = self._physical_fluxes[fid]
-                        sign = "+" if coeff > 0 else ""
-                        sources.append(f"{sign}{coeff} × {pf.flux} (磁通ID {fid})")
-                if sources:
-                    print(f"  磁通来源: {', '.join(sources)}")
+            if flux_ready:
+                print(f"  外磁通: {flux}")
+                if phys_vectors:
+                    sources = []
+                    for fid, pvec in phys_vectors.items():
+                        coeff = pvec[chord_key]
+                        if coeff != 0:
+                            pf = self._physical_fluxes[fid]
+                            sign = "+" if coeff > 0 else ""
+                            sources.append(f"{sign}{coeff} × {pf.flux} (磁通ID {fid})")
+                    if sources:
+                        print(f"  磁通来源: {', '.join(sources)}")
+            else:
+                print(f"  外磁通: 未确定")
             print()
+
+        if not flux_ready:
+            print(f"[注意] {flux_err_msg}")
 
     def _trace_comp_loop_directions(self, comp_loop):
         '''追踪元件回路中每个元件的遍历方向, 返回 [(from_node, to_node), ...]'''
@@ -712,7 +786,7 @@ class Circuit:
         M = F_C * D_C * F_C.T
         try:
             M_inv = M.inv()
-        except (ValueError, sp.matrices.common.NonInvertibleMatrixError):
+        except ValueError:
             raise ValueError("质量矩阵 M = F_C·D_C·F_C^T 奇异，无法求逆。请检查电容参数。")
         H_kin = (sp.Rational(1, 2) * q_t.T * M_inv * q_t)[0]
 
