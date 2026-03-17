@@ -39,21 +39,26 @@ class PhysicalFlux:
 
 class Circuit:
     '''
-    超导电路量子化对象 (动态构建版)
+    超导电路量子化对象 
 
     使用流程:
         1. 创建空电路:      circuit = Circuit()
         2. 添加元件:        cid = circuit.add_component(u, v, type, value)
         3. 添加互感 (可选): mid = circuit.add_mutual(cid1, cid2, value)
-        4. 添加物理磁通:    必须提供恰好 num_loops 个线性无关的物理回路
+        4. 设置外磁通 (二选一):
+           方式 A — 物理回路磁通 (需提供恰好 num_loops 个线性无关回路):
                             fid = circuit.add_physical_flux(comp_loop, flux)
                             磁通为 0 的回路也需添加: add_physical_flux(..., 0)
+           方式 B — 直接指定基本回路磁通 (可指定任意个):
+                            circuit.set_external_flux(loop_index, flux)
+                            未指定的回路默认磁通为 0
         5. 查看信息:        circuit.print_edges() / circuit.print_loops()
         6. 计算哈密顿量:    H, info = circuit.hamiltonian()
 
     元件/互感/磁通可随时增删, 所有计算按需自动重建图结构
+    两种磁通设置方式不可混用, 同时存在时会报错。
 
-    外磁通计算原理:
+    外磁通计算原理 (物理回路模式):
         每个物理回路可分解为基本回路的线性组合, 系数由回路在各连支上的分量决定。
         将所有物理回路排成矩阵方程 A · φ_ext = b, 解出各基本回路的外磁通。
         要求物理回路数 = 基本回路数 (连支数), 且矩阵 A 可逆 (回路线性无关)。
@@ -63,6 +68,7 @@ class Circuit:
         self._components = {}        # comp_id -> Component
         self._mutuals = {}           # mutual_id -> MutualInductance
         self._physical_fluxes = {}   # flux_id -> PhysicalFlux
+        self._fundamental_fluxes = {}  # chord_key -> flux (直接指定基本回路磁通)
         self._next_comp_id = 0
         self._next_mutual_id = 0
         self._next_flux_id = 0
@@ -85,6 +91,15 @@ class Circuit:
         '''标记图结构已变更, 需要重新构建'''
         self._dirty = True
         self._clear_cache()
+        # 图结构变更后 chord_key 可能改变, 清除直接指定的基本回路磁通
+        if self._fundamental_fluxes:
+            import warnings
+            warnings.warn(
+                "图结构已变更，之前通过 set_external_flux 设置的基本回路磁通已被清除。"
+                "请在图结构稳定后重新设置。",
+                UserWarning, stacklevel=3
+            )
+            self._fundamental_fluxes.clear()
 
     def _ensure_built(self):
         '''确保图结构已构建, 按需重建'''
@@ -262,7 +277,44 @@ class Circuit:
             raise KeyError(f"物理磁通 {flux_id} 不存在")
         del self._physical_fluxes[flux_id]
 
-    # 图构建 
+    # 基本回路磁通管理 (直接指定模式)
+
+    def _validate_loop_index(self, loop_index: int) -> int:
+        '''验证回路编号有效性, 返回对应的 chord_key'''
+        self._ensure_built()
+        num = self._m - self._nt
+        if loop_index < 0 or loop_index >= num:
+            raise IndexError(f"回路编号 {loop_index} 超出范围 [0, {num - 1}]")
+        return self._loops[loop_index]['chord_key']
+
+    def set_external_flux(self, loop_index: int, flux):
+        '''
+        直接设置某个基本回路的外磁通
+
+        此方式与 add_physical_flux 互斥, 不可混用。
+        调用此方法后即进入"直接指定模式", 需用 clear_external_fluxes() 清除后
+        才能改用 add_physical_flux。
+
+        参数:
+            loop_index: 回路编号 (0-based, 对应 print_loops 中显示的回路编号)
+            flux: 外磁通值, 可以是 sympy 表达式、字符串(自动转符号) 或数值
+                  设为 0 表示该回路无外磁通
+        '''
+        chord_key = self._validate_loop_index(loop_index)
+        if isinstance(flux, str):
+            flux = sp.symbols(flux)
+        self._fundamental_fluxes[chord_key] = flux
+
+    def get_external_flux(self, loop_index: int):
+        '''获取某个基本回路当前直接设置的外磁通'''
+        chord_key = self._validate_loop_index(loop_index)
+        return self._fundamental_fluxes.get(chord_key, 0)
+
+    def clear_external_fluxes(self):
+        '''清除所有直接设置的基本回路磁通'''
+        self._fundamental_fluxes.clear()
+
+    # 图构建
 
     def _rebuild(self):
         '''重新构建电路图、生成树、基本回路'''
@@ -380,25 +432,34 @@ class Circuit:
 
     def _compute_external_fluxes(self) -> dict:
         '''
-        从所有物理磁通解出各基本回路的外磁通
+        计算各基本回路的外磁通
 
-        原理:
-            每个物理回路 p 可分解为基本回路的线性组合: p = Σ c_i ℓ_i
-            其中 c_i = p 在连支 i 上的分量 (±1 或 0)
-            物理回路 p 的总磁通 Φ_p = Σ c_i · φ_ext_i
-
-            将所有物理回路排成矩阵方程: A · φ_ext = b
-            其中 A[p, i] = c_i (物理回路 p 在连支 i 上的分量)
-                 b[p] = Φ_p (物理回路 p 的磁通)
-
-            要求用户提供恰好 num_loops 个线性无关的物理回路 (含磁通为 0 的),
-            使得 A 为方阵且可逆, 从而唯一解出 φ_ext = A⁻¹ · b
+        支持两种模式 (不可混用):
+        1. 物理回路模式: 从 add_physical_flux 提供的物理回路分解得到
+        2. 直接指定模式: 从 set_external_flux 直接设置, 未指定的回路磁通为 0
         '''
         num_chords = self._m - self._nt
 
         if num_chords == 0:
             return {}
 
+        has_physical = bool(self._physical_fluxes)
+        has_fundamental = bool(self._fundamental_fluxes)
+
+        if has_physical and has_fundamental:
+            raise ValueError(
+                "不可同时使用物理回路磁通 (add_physical_flux) 和"
+                "直接指定基本回路磁通 (set_external_flux)。"
+                "请只使用其中一种方式。"
+            )
+
+        chord_keys = [loop['chord_key'] for loop in self._loops]
+
+        # 模式 B: 直接指定基本回路磁通
+        if has_fundamental:
+            return {ck: self._fundamental_fluxes.get(ck, 0) for ck in chord_keys}
+
+        # 模式 A: 物理回路分解
         phys_list = list(self._physical_fluxes.values())
         num_phys = len(phys_list)
 
@@ -408,8 +469,6 @@ class Circuit:
                 f"当前已提供 {num_phys} 个。"
                 f"即使磁通为 0 的回路也必须添加 (使用 add_physical_flux(..., 0))。"
             )
-
-        chord_keys = [loop['chord_key'] for loop in self._loops]
 
         # 构建分解矩阵 A 和磁通向量 b
         A = sp.zeros(num_phys, num_chords)
@@ -571,6 +630,13 @@ class Circuit:
         '''当前物理磁通字典 {flux_id: PhysicalFlux}'''
         return dict(self._physical_fluxes)
 
+    @property
+    def fundamental_fluxes(self):
+        '''当前直接设置的基本回路磁通 {loop_index: flux}'''
+        self._ensure_built()
+        chord_to_index = {loop['chord_key']: i for i, loop in enumerate(self._loops)}
+        return {chord_to_index[ck]: flux for ck, flux in self._fundamental_fluxes.items()}
+
     # 打印信息 
 
     def print_components(self):
@@ -645,7 +711,13 @@ class Circuit:
             # 显示外磁通及其来源
             if flux_ready:
                 print(f"  外磁通: {flux}")
-                if phys_vectors:
+                if self._fundamental_fluxes:
+                    # 直接指定模式
+                    if chord_key in self._fundamental_fluxes:
+                        print(f"  磁通来源: 直接指定 (set_external_flux)")
+                    else:
+                        print(f"  磁通来源: 默认值 0 (未指定)")
+                elif phys_vectors:
                     sources = []
                     for fid, pvec in phys_vectors.items():
                         coeff = pvec[chord_key]
@@ -763,7 +835,7 @@ class Circuit:
         phi_t = sp.Matrix([sp.symbols(f'Phi_t_{i}') for i in range(nt)])
         q_t = sp.Matrix([sp.symbols(f'Q_t_{i}') for i in range(nt)])
 
-        # 2. 构建外磁通向量 (由物理磁通自动计算)
+        # 2. 构建外磁通向量 (由物理磁通分解或直接指定)
         phi_ext_list = []
         ext_flux_symbols = set()
 

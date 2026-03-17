@@ -8,7 +8,9 @@
 - 支持电感间的**互感耦合**
 - 自动选择最小权重生成树（JJ/L 优先进入树枝，电容倾向连支）
 - 计算基本割集矩阵 $Q_f$
-- 通过**物理回路**绑定外磁通，支持多磁通自动叠加
+- **两种外磁通设置方式**（二选一，不可混用）：
+  - **方式 A**：通过**物理回路**绑定外磁通，支持多磁通自动叠加
+  - **方式 B**：直接指定基本回路磁通，可指定任意个，未指定的默认为 0
 - 符号推导完整哈密顿量：动能（电场能）+ 电感势能 + 约瑟夫逊势能
 - 支持 Jupyter Notebook 交互式使用
 
@@ -36,10 +38,18 @@ cc1 = circuit.add_component(0, 2, 'C',  'C1')
 cc2 = circuit.add_component(1, 2, 'C',  'C2')
 
 # 添加互感（只能施加在电感之间）
-mid = circuit.add_mutual(cl, cl, 'M')  # 示例：同一电感自耦合
+# mid = circuit.add_mutual(cl1, cl2, 'M12')
 
-# 添加物理外磁通（元件 ID 列表按顺序围成回路）
-circuit.add_physical_flux([cj1, cl, cj2], 'Phi_e')
+# ---- 外磁通方式 A：物理回路 ----
+# 需提供恰好 num_loops 个线性无关的物理回路（含磁通为 0 的）
+circuit.add_physical_flux([cc1, cc2, cl], 'Phi_ext')
+circuit.add_physical_flux([cj1, cc1], 0, direction=1)
+circuit.add_physical_flux([cj2, cc2], 0, direction=1)
+
+# ---- 外磁通方式 B：直接指定基本回路磁通（与方式 A 二选一）----
+# circuit.set_external_flux(0, 'Phi_ext')   # 只需设置非零的回路
+# circuit.get_external_flux(0)              # 查询
+# circuit.clear_external_fluxes()           # 清除后可切换回方式 A
 
 # 查看信息
 circuit.print_edges()
@@ -77,14 +87,32 @@ cl2 = circuit.add_component(1, 2, 'L', 'L2')
 circuit.add_mutual(cl1, cl2, 'M12')
 ```
 
-### 物理外磁通
+### 外磁通
 
-通过元件 ID 列表指定物理回路，顺序决定磁通正方向（右手定则）。相同物理回路的磁通自动合并：
+提供两种互斥的设置方式：
+
+#### 方式 A：物理回路磁通
+
+通过元件 ID 列表指定物理回路，顺序决定磁通正方向（右手定则）。需提供恰好 `num_loops` 个线性无关的物理回路（含磁通为 0 的），相同物理回路的磁通自动合并：
 
 ```python
-# 元件 ID 按顺序围成闭合回路
-circuit.add_physical_flux([cj1, cl, cj2], 'Phi_e')
+circuit.add_physical_flux([cj1, cl, cj2], 'Phi_e')   # 有磁通的回路
+circuit.add_physical_flux([cj1, cc1], 0, direction=1)  # 磁通为 0 也要添加
 ```
+
+#### 方式 B：直接指定基本回路磁通
+
+直接为基本回路设置外磁通值，可指定任意个，未指定的默认为 0：
+
+```python
+circuit.set_external_flux(0, 'Phi_ext')  # 回路 0 的外磁通
+circuit.set_external_flux(1, 0)          # 可选：显式设为 0
+circuit.get_external_flux(0)             # 查询回路 0 的磁通
+circuit.fundamental_fluxes               # 查看所有已设置的 {回路编号: 磁通}
+circuit.clear_external_fluxes()          # 清除所有（清除后可切换回方式 A）
+```
+
+> **注意**：两种方式不可混用。若已使用 `set_external_flux`，需先调用 `clear_external_fluxes()` 才能使用 `add_physical_flux`，反之亦然（需先删除所有物理磁通）。修改元件/图结构时，已设置的基本回路磁通会自动清除。
 
 ### 动态修改
 
@@ -111,5 +139,5 @@ Circuit-quantization/
 1. **构建电路图** — 将元件构建为 NetworkX 多重图，计算最小权重生成树，对所有支路重新编号（树枝 `0..nt-1`，连支 `nt..m-1`）
 2. **基本割集矩阵** — 对每个树枝，移除后找连通分量，确定哪些连支穿越割集，构建 $Q_f$ 矩阵
 3. **参数矩阵** — 构建电容矩阵 $D_C$、电感逆矩阵 $L^+$（含互感）、约瑟夫逊矩阵 $D_J$
-4. **外磁通分解** — 将物理回路投影到基本回路空间，计算各基本回路的外磁通分量
+4. **外磁通** — 方式 A：将物理回路投影到基本回路空间，解线性方程组；方式 B：直接使用用户指定的值
 5. **哈密顿量** — 动能 $\frac{1}{2} q^T M^{-1} q$ + 电感势能 $\frac{1}{2} \Phi^T L^+ \Phi$ + 约瑟夫逊势能 $-\sum E_J \cos(\Phi_k)$
