@@ -1,5 +1,45 @@
 import sympy as sp
 import networkx as nx
+import heapq
+
+
+class IdPool:
+    '''
+    编号池: 分配和回收整数编号
+
+    分配时自动选择最小的可用编号 (从 0 开始),
+    回收后编号可被后续分配重新使用。
+    '''
+    def __init__(self):
+        self._in_use = set()       # 当前已分配的编号
+        self._recycled = []        # 最小堆, 存放已回收的编号
+        self._next_new = 0         # 下一个全新编号 (未被分配过的最小值)
+
+    def allocate(self) -> int:
+        '''分配最小的可用编号'''
+        # 优先从回收池中取最小编号
+        while self._recycled:
+            candidate = heapq.heappop(self._recycled)
+            if candidate not in self._in_use:
+                self._in_use.add(candidate)
+                return candidate
+        # 回收池为空, 分配全新编号
+        new_id = self._next_new
+        self._next_new += 1
+        self._in_use.add(new_id)
+        return new_id
+
+    def release(self, id_val: int):
+        '''回收编号, 使其可被再次分配'''
+        if id_val not in self._in_use:
+            raise KeyError(f"编号 {id_val} 未被分配, 无法回收")
+        self._in_use.discard(id_val)
+        heapq.heappush(self._recycled, id_val)
+
+    @property
+    def used(self) -> set:
+        '''当前已分配的编号集合'''
+        return set(self._in_use)
 
 
 class Component:
@@ -69,9 +109,11 @@ class Circuit:
         self._mutuals = {}           # mutual_id -> MutualInductance
         self._physical_fluxes = {}   # flux_id -> PhysicalFlux
         self._fundamental_fluxes = {}  # chord_key -> flux (直接指定基本回路磁通)
-        self._next_comp_id = 0
-        self._next_mutual_id = 0
-        self._next_flux_id = 0
+        self._comp_pool = IdPool()     # 元件编号池
+        self._mutual_pool = IdPool()   # 互感编号池
+        self._flux_pool = IdPool()     # 物理磁通编号池
+        self._node_pool = IdPool()     # 节点编号池
+        self._node_refcount = {}       # 节点引用计数: node_id -> 引用该节点的元件数
         self._dirty = True
         self._clear_cache()
 
@@ -109,35 +151,89 @@ class Circuit:
             self._rebuild()
             self._dirty = False
 
-    # 元件管理 
+    # 节点管理
+
+    def add_node(self) -> int:
+        '''
+        添加节点, 自动分配最小可用编号
+
+        返回: 节点编号
+        '''
+        node_id = self._node_pool.allocate()
+        self._node_refcount[node_id] = 0
+        return node_id
+
+    def _ensure_node(self, node_id: int):
+        '''确保节点已注册, 未注册则自动注册 (兼容手动指定节点编号的旧用法)'''
+        if node_id not in self._node_refcount:
+            # 手动指定的节点: 在编号池中标记为已使用
+            if node_id not in self._node_pool._in_use:
+                # 将跳过的编号加入回收池, 使 add_node() 能分配到它们
+                for skipped in range(self._node_pool._next_new, node_id):
+                    if skipped not in self._node_pool._in_use:
+                        heapq.heappush(self._node_pool._recycled, skipped)
+                self._node_pool._in_use.add(node_id)
+                if node_id >= self._node_pool._next_new:
+                    self._node_pool._next_new = node_id + 1
+            self._node_refcount[node_id] = 0
+
+    def _ref_node(self, node_id: int):
+        '''增加节点引用计数'''
+        self._ensure_node(node_id)
+        self._node_refcount[node_id] += 1
+
+    def _unref_node(self, node_id: int):
+        '''减少节点引用计数, 归零时自动回收'''
+        if node_id in self._node_refcount:
+            self._node_refcount[node_id] -= 1
+            if self._node_refcount[node_id] <= 0:
+                del self._node_refcount[node_id]
+                if node_id in self._node_pool._in_use:
+                    self._node_pool.release(node_id)
+
+    @property
+    def nodes(self) -> set:
+        '''当前活跃的节点编号集合'''
+        return set(self._node_refcount.keys())
+
+    # 元件管理
 
     def add_component(self, u: int, v: int, tp: str, value) -> int:
         '''
         添加元件
 
         参数:
-            u, v: 节点编号
+            u, v: 节点编号 (可使用 add_node() 自动分配, 或手动指定)
             tp: 元件类型 ('C', 'L', 'JJ')
             value: 参数值 (字符串自动转为 sympy 符号)
 
         返回: 元件 ID (用于后续引用)
         '''
-        comp_id = self._next_comp_id
-        self._next_comp_id += 1
+        comp_id = self._comp_pool.allocate()
         self._components[comp_id] = Component(u, v, tp, value)
+        # 更新节点引用计数
+        comp = self._components[comp_id]
+        self._ref_node(comp.u)
+        self._ref_node(comp.v)
         self._mark_dirty()
         return comp_id
 
     def remove_component(self, comp_id: int):
-        '''删除元件 (关联的互感会一并删除)'''
+        '''删除元件 (关联的互感会一并删除, 孤立节点自动回收)'''
         if comp_id not in self._components:
             raise KeyError(f"元件 {comp_id} 不存在")
+        comp = self._components[comp_id]
         del self._components[comp_id]
+        self._comp_pool.release(comp_id)
+        # 减少节点引用计数 (可能触发节点回收)
+        self._unref_node(comp.u)
+        self._unref_node(comp.v)
         # 移除引用了该元件的互感
         to_remove = [k for k, m in self._mutuals.items()
                      if m.comp_id1 == comp_id or m.comp_id2 == comp_id]
         for k in to_remove:
             del self._mutuals[k]
+            self._mutual_pool.release(k)
         self._mark_dirty()
 
     # 互感管理 
@@ -157,8 +253,7 @@ class Circuit:
         for cid in (comp_id1, comp_id2):
             if self._components[cid].type != 'L':
                 raise TypeError(f"元件 {cid} 不是电感（type='{self._components[cid].type}'），互感只能施加在电感之间")
-        mutual_id = self._next_mutual_id
-        self._next_mutual_id += 1
+        mutual_id = self._mutual_pool.allocate()
         self._mutuals[mutual_id] = MutualInductance(comp_id1, comp_id2, value)
         self._mark_dirty()
         return mutual_id
@@ -168,6 +263,7 @@ class Circuit:
         if mutual_id not in self._mutuals:
             raise KeyError(f"互感 {mutual_id} 不存在")
         del self._mutuals[mutual_id]
+        self._mutual_pool.release(mutual_id)
         self._mark_dirty()
 
     # 物理磁通管理
@@ -266,8 +362,7 @@ class Circuit:
                 return fid
 
         # 新回路: 以规范形式存储
-        flux_id = self._next_flux_id
-        self._next_flux_id += 1
+        flux_id = self._flux_pool.allocate()
         self._physical_fluxes[flux_id] = PhysicalFlux(list(canonical), canonical_flux)
         return flux_id
 
@@ -276,6 +371,7 @@ class Circuit:
         if flux_id not in self._physical_fluxes:
             raise KeyError(f"物理磁通 {flux_id} 不存在")
         del self._physical_fluxes[flux_id]
+        self._flux_pool.release(flux_id)
 
     # 基本回路磁通管理 (直接指定模式)
 
@@ -637,7 +733,21 @@ class Circuit:
         chord_to_index = {loop['chord_key']: i for i, loop in enumerate(self._loops)}
         return {chord_to_index[ck]: flux for ck, flux in self._fundamental_fluxes.items()}
 
-    # 打印信息 
+    @property
+    def mutuals(self):
+        '''当前互感字典 {mutual_id: MutualInductance}'''
+        return dict(self._mutuals)
+
+    # 打印信息
+
+    def print_nodes(self):
+        '''打印所有活跃节点及其引用计数'''
+        if not self._node_refcount:
+            print("电路中没有节点")
+            return
+        print(f"共 {len(self._node_refcount)} 个活跃节点:")
+        for nid in sorted(self._node_refcount.keys()):
+            print(f"  节点 {nid}: 被 {self._node_refcount[nid]} 个元件引用")
 
     def print_components(self):
         '''打印所有元件'''
