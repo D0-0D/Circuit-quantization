@@ -153,16 +153,6 @@ class Circuit:
 
     # 节点管理
 
-    def add_node(self) -> int:
-        '''
-        添加节点, 自动分配最小可用编号
-
-        返回: 节点编号
-        '''
-        node_id = self._node_pool.allocate()
-        self._node_refcount[node_id] = 0
-        return node_id
-
     def _ensure_node(self, node_id: int):
         '''确保节点已注册, 未注册则自动注册 (兼容手动指定节点编号的旧用法)'''
         if node_id not in self._node_refcount:
