@@ -1,4 +1,5 @@
 import sympy as sp
+import numpy as np
 import networkx as nx
 import heapq
 
@@ -574,7 +575,19 @@ class Circuit:
             )
 
         # 解线性方程组: A · φ_ext = b
-        x = A.LUsolve(b)
+        if not (A.free_symbols or b.free_symbols):
+            # 转换为 NumPy 数组
+            A_np = np.array(A).astype(float)
+            b_np = np.array(b).astype(float).flatten()
+            try:
+                x_np = np.linalg.solve(A_np, b_np)
+                # 将结果包装回 SymPy 矩阵
+                x = sp.Matrix(x_np.tolist())
+            except np.linalg.LinAlgError:
+                # 如果数值求解失败（如奇异），回退到符号求解
+                x = A.LUsolve(b)
+        else:
+            x = A.LUsolve(b)
 
         return {ck: sp.nsimplify(x[j]) for j, ck in enumerate(chord_keys)}
 
@@ -643,21 +656,33 @@ class Circuit:
             L_sub = sp.zeros(n_L, n_L)
             local_to_global = {i: k for i, k in enumerate(L_indices)}
 
+            all_numeric = True
             for i in range(n_L):
                 k_i = local_to_global[i]
-                L_sub[i, i] = edge_map[k_i]['value']
+                val_i = edge_map[k_i]['value']
+                if isinstance(val_i, sp.Basic) and val_i.free_symbols:
+                    all_numeric = False
+                L_sub[i, i] = val_i
                 for j in range(i + 1, n_L):
                     k_j = local_to_global[j]
                     key_tuple = tuple(sorted((k_i, k_j)))
                     if key_tuple in mutual_dict:
-                        val = mutual_dict[key_tuple]
-                        L_sub[i, j] = val
-                        L_sub[j, i] = val
+                        val_ij = mutual_dict[key_tuple]
+                        if isinstance(val_ij, sp.Basic) and val_ij.free_symbols:
+                            all_numeric = False
+                        L_sub[i, j] = val_ij
+                        L_sub[j, i] = val_ij
 
-            try:
-                Gamma_sub = L_sub.inv()
-            except ValueError:
-                raise ValueError("电感矩阵奇异，无法求逆。请检查互感参数或电路拓扑。")
+            if all_numeric:
+                # 使用 NumPy 求逆，结果转为 SymPy 矩阵保持接口一致
+                L_sub_np = np.array(L_sub).astype(float)   # 假设所有值可转为 float
+                Gamma_sub_np = np.linalg.inv(L_sub_np)
+                Gamma_sub = sp.Matrix(Gamma_sub_np.tolist())
+            else:
+                try:
+                    Gamma_sub = L_sub.inv()
+                except ValueError:
+                    raise ValueError("电感矩阵奇异，无法求逆。请检查互感参数或电路拓扑。")
 
             L_plus = sp.zeros(num_edges, num_edges)
             for i in range(n_L):
@@ -955,11 +980,37 @@ class Circuit:
         Phi_vec = F_C.T * phi_t + phi_ext_vec
 
         # 4. 动能: H_kin = ½ q^T M^{-1} q
-        M = F_C * D_C * F_C.T
-        try:
-            M_inv = M.inv()
-        except ValueError:
-            raise ValueError("质量矩阵 M = F_C·D_C·F_C^T 奇异，无法求逆。请检查电容参数。")
+        if not D_C.free_symbols:
+            # 将 F_C 和 D_C 转换为 NumPy 数组
+            F_C_np = np.array(F_C).astype(int)      # F_C 元素为 -1,0,1
+            D_C_np = np.diag(np.array(D_C).astype(float))
+            M_np = F_C_np @ D_C_np @ F_C_np.T
+            M = sp.Matrix(M_np.tolist())
+        else:
+            M = F_C * D_C * F_C.T
+        
+        # 判断 M 是否为纯数值矩阵（不含符号）
+        if not M.free_symbols:  # free_symbols 返回矩阵中所有自由符号的集合
+            try:
+                # 转换为 NumPy 数组（float 类型）
+                M_np = np.array(M).astype(float)
+                # 使用 NumPy 求逆
+                M_inv_np = np.linalg.inv(M_np)
+                # 转回 SymPy 矩阵
+                M_inv = sp.Matrix(M_inv_np.tolist())
+            except (np.linalg.LinAlgError, ValueError) as e:
+                # 如果数值求逆失败（如奇异矩阵），回退到符号求逆并给出警告
+                import warnings
+                warnings.warn(
+                    f"NumPy 数值求逆失败 ({e})，回退到 SymPy 符号求逆。",
+                    RuntimeWarning, stacklevel=2
+                )
+                M_inv = M.inv()
+        else:
+            try:
+                M_inv = M.inv()
+            except ValueError:
+                raise ValueError("质量矩阵 M = F_C·D_C·F_C^T 奇异，无法求逆。请检查电容参数。")
         H_kin = (sp.Rational(1, 2) * q_t.T * M_inv * q_t)[0]
 
         # 5. 电感势能: H_L = ½ Phi^T L_plus Phi
@@ -988,5 +1039,102 @@ class Circuit:
         }
 
         return H_total, info
+    
+    def hamiltonian_symbols(self):
+        """
+        返回哈密顿量表达式中涉及的符号分类信息。
+
+        Returns
+        -------
+        dyn_vars : list of Symbol
+            动态变量列表，顺序为 [Phi_t0, Phi_t1, ..., Q_t0, Q_t1, ...]。
+        param_symbols : list of Symbol
+            其他参数符号（如元件值、外磁通）列表，按字符串排序。
+        """
+        H, info = self.hamiltonian()   # 确保构建并获取表达式
+        phi_vars = list(info['phi_t'])
+        q_vars = list(info['q_t'])
+        dyn_vars = phi_vars + q_vars
+        all_other = sorted(H.free_symbols - set(dyn_vars), key=str)
+        return dyn_vars, all_other
+
+    def lambdify_hamiltonian(self, parameters=None):
+        """
+        将符号哈密顿量转换为 NumPy 可调用的函数。
+
+        参数
+        ----------
+        parameters : dict, optional
+            将符号参数映射为数值的字典。如果提供，则返回的函数只接受动态变量；
+            否则返回的函数接受动态变量后跟所有其他符号参数。
+
+        返回
+        -------
+        func : callable
+            一个 NumPy 函数，用于计算哈密顿量的数值。
+
+            如果提供了 parameters：
+                func(phi_vals, q_vals) -> 数值
+                其中 phi_vals 和 q_vals 是长度为 nt 的序列（每个元素可以是标量或可广播的数组），
+                分别对应树枝磁通和树枝电荷。
+
+            如果未提供 parameters：
+                func(phi_vals, q_vals, *param_vals) -> 数值
+                其中 param_vals 是按顺序排列的其他符号参数的值，
+                顺序可通过 `hamiltonian_symbols()[1]` 获取。
+        """
+        H, info = self.hamiltonian()
+        phi_vars = list(info['phi_t'])
+        q_vars = list(info['q_t'])
+        dyn_vars = phi_vars + q_vars
+        all_other = sorted(H.free_symbols - set(dyn_vars), key=str)
+
+        if parameters is not None:
+            # 检查是否所有其他符号都已赋值
+            missing = set(all_other) - set(parameters.keys())
+            if missing:
+                raise ValueError(f"未提供以下参数的值: {missing}")
+            # 代入参数值
+            H_sub = H.subs(parameters)
+            # 检查是否还有未确定的符号（应为动态变量）
+            remaining = H_sub.free_symbols - set(dyn_vars)
+            if remaining:
+                raise ValueError(f"代入后仍有未知符号: {remaining}")
+            # 创建仅关于动态变量的函数
+            func = sp.lambdify(dyn_vars, H_sub, modules='numpy')
+
+            def wrapped(phi_vals, q_vals):
+                # 将 phi_vals, q_vals 转换为列表，确保每个变量作为单独参数传入
+                if not isinstance(phi_vals, (list, tuple)):
+                    phi_vals = [phi_vals]
+                if not isinstance(q_vals, (list, tuple)):
+                    q_vals = [q_vals]
+                if len(phi_vals) != self.nt or len(q_vals) != self.nt:
+                    raise ValueError(
+                        f"phi_vals 和 q_vals 的长度必须为 {self.nt}，"
+                        f"当前长度 phi: {len(phi_vals)}, q: {len(q_vals)}"
+                    )
+                return func(*(phi_vals + q_vals))
+            return wrapped
+        else:
+            # 返回包含所有变量的函数
+            func = sp.lambdify(dyn_vars + all_other, H, modules='numpy')
+
+            def wrapped(phi_vals, q_vals, *param_vals):
+                if len(param_vals) != len(all_other):
+                    raise ValueError(
+                        f"需要 {len(all_other)} 个参数，但得到了 {len(param_vals)} 个。"
+                        f"参数顺序: {[str(s) for s in all_other]}"
+                    )
+                if not isinstance(phi_vals, (list, tuple)):
+                    phi_vals = [phi_vals]
+                if not isinstance(q_vals, (list, tuple)):
+                    q_vals = [q_vals]
+                if len(phi_vals) != self.nt or len(q_vals) != self.nt:
+                    raise ValueError(
+                        f"phi_vals 和 q_vals 的长度必须为 {self.nt}"
+                    )
+                return func(*(phi_vals + q_vals + list(param_vals)))
+            return wrapped
 
 
