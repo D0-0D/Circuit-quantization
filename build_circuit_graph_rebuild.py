@@ -129,6 +129,14 @@ class Circuit:
         self._mutual_dict = None
         self._F_C_cache = None
         self._comp_to_edge = None   # comp_id -> edge_key (重编号后)
+        self._param_matrices_cache = None   # (D_C, L_plus, D_J)
+        self._ext_fluxes_cache = None       # 外磁通 dict
+        self._hamiltonian_cache = None      # (H_total, info)
+
+    def _clear_flux_dependent_cache(self):
+        '''清除依赖外磁通的缓存 (磁通改变时调用, 不影响参数矩阵)'''
+        self._ext_fluxes_cache = None
+        self._hamiltonian_cache = None
 
     def _mark_dirty(self):
         '''标记图结构已变更, 需要重新构建'''
@@ -263,7 +271,7 @@ class Circuit:
     def _normalize_comp_loop(comp_loop):
         '''
         标准化元件回路: 返回 (canonical_tuple, direction)
-
+    
         canonical_tuple: 规范化的元件 ID 元组 (所有旋转/反转中字典序最小的)
         direction: +1 (同向) 或 -1 (反向, 即原始回路与规范形式方向相反)
         '''
@@ -350,11 +358,13 @@ class Circuit:
         for fid, pf in self._physical_fluxes.items():
             if tuple(pf.comp_loop) == canonical:
                 pf.flux = sp.nsimplify(pf.flux + canonical_flux)
+                self._clear_flux_dependent_cache()
                 return fid
 
         # 新回路: 以规范形式存储
         flux_id = self._flux_pool.allocate()
         self._physical_fluxes[flux_id] = PhysicalFlux(list(canonical), canonical_flux)
+        self._clear_flux_dependent_cache()
         return flux_id
 
     def remove_physical_flux(self, flux_id: int):
@@ -363,6 +373,7 @@ class Circuit:
             raise KeyError(f"物理磁通 {flux_id} 不存在")
         del self._physical_fluxes[flux_id]
         self._flux_pool.release(flux_id)
+        self._clear_flux_dependent_cache()
 
     # 基本回路磁通管理 (直接指定模式)
 
@@ -391,6 +402,7 @@ class Circuit:
         if isinstance(flux, str):
             flux = sp.symbols(flux)
         self._fundamental_fluxes[chord_key] = flux
+        self._clear_flux_dependent_cache()
 
     def get_external_flux(self, loop_index: int):
         '''获取某个基本回路当前直接设置的外磁通'''
@@ -400,6 +412,7 @@ class Circuit:
     def clear_external_fluxes(self):
         '''清除所有直接设置的基本回路磁通'''
         self._fundamental_fluxes.clear()
+        self._clear_flux_dependent_cache()
 
     # 图构建
 
@@ -525,10 +538,14 @@ class Circuit:
         1. 物理回路模式: 从 add_physical_flux 提供的物理回路分解得到
         2. 直接指定模式: 从 set_external_flux 直接设置, 未指定的回路磁通为 0
         '''
+        if self._ext_fluxes_cache is not None:
+            return dict(self._ext_fluxes_cache)
+
         num_chords = self._m - self._nt
 
         if num_chords == 0:
-            return {}
+            self._ext_fluxes_cache = {}
+            return self._ext_fluxes_cache
 
         has_physical = bool(self._physical_fluxes)
         has_fundamental = bool(self._fundamental_fluxes)
@@ -544,7 +561,8 @@ class Circuit:
 
         # 模式 B: 直接指定基本回路磁通
         if has_fundamental:
-            return {ck: self._fundamental_fluxes.get(ck, 0) for ck in chord_keys}
+            self._ext_fluxes_cache = {ck: self._fundamental_fluxes.get(ck, 0) for ck in chord_keys}
+            return self._ext_fluxes_cache
 
         # 模式 A: 物理回路分解
         phys_list = list(self._physical_fluxes.values())
@@ -557,39 +575,40 @@ class Circuit:
                 f"即使磁通为 0 的回路也必须添加 (使用 add_physical_flux(..., 0))。"
             )
 
-        # 构建分解矩阵 A 和磁通向量 b
-        A = sp.zeros(num_phys, num_chords)
-        b = sp.zeros(num_phys, 1)
-
-        for i, pf in enumerate(phys_list):
+        # 构建分解矩阵 A (整数) 和磁通向量 b
+        A_list = []
+        b_list = []
+        for pf in phys_list:
             p = self._physical_loop_to_signed_vector(pf)
-            for j, ck in enumerate(chord_keys):
-                A[i, j] = p[ck]
-            b[i] = pf.flux
+            A_list.append([p[ck] for ck in chord_keys])
+            b_list.append(pf.flux)
 
-        # 检查物理回路是否线性无关
-        if A.rank() < num_chords:
+        # A 元素始终为 -1,0,1, 用 NumPy 检查秩更高效
+        A_np = np.array(A_list, dtype=float)
+        if np.linalg.matrix_rank(A_np) < num_chords:
             raise ValueError(
                 "提供的物理回路线性相关，无法唯一确定各基本回路的外磁通。"
                 "请确保每个物理回路对应不同的独立孔洞。"
             )
 
         # 解线性方程组: A · φ_ext = b
-        if not (A.free_symbols or b.free_symbols):
-            # 转换为 NumPy 数组
-            A_np = np.array(A).astype(float)
-            b_np = np.array(b).astype(float).flatten()
+        b_has_symbols = any(isinstance(v, sp.Basic) and v.free_symbols for v in b_list)
+
+        if not b_has_symbols:
+            # 纯数值路径: 使用 NumPy 求解
+            b_np = np.array([float(v) for v in b_list])
             try:
                 x_np = np.linalg.solve(A_np, b_np)
-                # 将结果包装回 SymPy 矩阵
                 x = sp.Matrix(x_np.tolist())
             except np.linalg.LinAlgError:
-                # 如果数值求解失败（如奇异），回退到符号求解
-                x = A.LUsolve(b)
+                # 数值求解失败，回退到符号求解
+                x = sp.Matrix(A_list).LUsolve(sp.Matrix(b_list))
         else:
-            x = A.LUsolve(b)
+            # 磁通含符号: 使用 SymPy 求解
+            x = sp.Matrix(A_list).LUsolve(sp.Matrix(b_list))
 
-        return {ck: sp.nsimplify(x[j]) for j, ck in enumerate(chord_keys)}
+        self._ext_fluxes_cache = {ck: sp.nsimplify(x[j]) for j, ck in enumerate(chord_keys)}
+        return self._ext_fluxes_cache
 
     #  基本割集矩阵 
 
@@ -626,11 +645,88 @@ class Circuit:
 
     #  参数矩阵 
 
+    @staticmethod
+    def _is_numeric(val):
+        '''判断值是否为纯数值（非符号表达式）'''
+        if isinstance(val, (int, float, complex)):
+            return True
+        if isinstance(val, sp.Basic):
+            return not val.free_symbols
+        return True
+
     def _build_parameter_matrices(self):
-        '''构建 D_C (电容), L_plus (电感逆), D_J (约瑟夫森) 矩阵'''
+        '''构建 D_C (电容), L_plus (电感逆), D_J (约瑟夫森) 矩阵 (带缓存)
+
+        当所有元件参数均为数值时，使用 NumPy 加速矩阵计算；
+        否则回退到 SymPy 符号计算。
+        '''
+        if self._param_matrices_cache is not None:
+            return self._param_matrices_cache
         edge_map = self._edge_map
         mutual_dict = self._mutual_dict
         num_edges = len(edge_map)
+
+        # 检测所有值是否为纯数值
+        all_numeric = all(self._is_numeric(info['value']) for info in edge_map.values())
+        if all_numeric:
+            all_numeric = all(self._is_numeric(v) for v in mutual_dict.values())
+
+        if all_numeric:
+            self._param_matrices_cache = self._build_parameter_matrices_numpy(
+                edge_map, mutual_dict, num_edges)
+        else:
+            self._param_matrices_cache = self._build_parameter_matrices_sympy(
+                edge_map, mutual_dict, num_edges)
+        return self._param_matrices_cache
+
+    def _build_parameter_matrices_numpy(self, edge_map, mutual_dict, num_edges):
+        '''纯数值路径: 使用 NumPy 构建参数矩阵，最后转为 SymPy 保持接口一致'''
+
+        # 电容矩阵 D_C
+        Dc_arr = np.zeros(num_edges)
+        for k, info in edge_map.items():
+            if info['type'] == 'C':
+                Dc_arr[k] = float(info['value'])
+        D_C = sp.Matrix(np.diag(Dc_arr).tolist())
+
+        # 约瑟夫森矩阵 D_J
+        Dj_arr = np.zeros(num_edges)
+        for k, info in edge_map.items():
+            if info['type'] == 'JJ':
+                Dj_arr[k] = float(info['value'])
+        D_J = sp.Matrix(np.diag(Dj_arr).tolist())
+
+        # 电感逆矩阵 L_plus
+        L_indices = [k for k, info in edge_map.items() if info['type'] == 'L']
+
+        if not L_indices:
+            L_plus = sp.zeros(num_edges, num_edges)
+        else:
+            n_L = len(L_indices)
+            L_sub_np = np.zeros((n_L, n_L))
+            local_to_global = {i: k for i, k in enumerate(L_indices)}
+
+            for i in range(n_L):
+                L_sub_np[i, i] = float(edge_map[local_to_global[i]]['value'])
+                for j in range(i + 1, n_L):
+                    key_tuple = tuple(sorted((local_to_global[i], local_to_global[j])))
+                    if key_tuple in mutual_dict:
+                        val = float(mutual_dict[key_tuple])
+                        L_sub_np[i, j] = val
+                        L_sub_np[j, i] = val
+
+            Gamma_sub_np = np.linalg.inv(L_sub_np)
+
+            L_plus_np = np.zeros((num_edges, num_edges))
+            for i in range(n_L):
+                for j in range(n_L):
+                    L_plus_np[local_to_global[i], local_to_global[j]] = Gamma_sub_np[i, j]
+            L_plus = sp.Matrix(L_plus_np.tolist())
+
+        return (D_C, L_plus, D_J)
+
+    def _build_parameter_matrices_sympy(self, edge_map, mutual_dict, num_edges):
+        '''符号路径: 使用 SymPy 构建参数矩阵'''
 
         # 电容矩阵 D_C
         Dc_list = [0] * num_edges
@@ -656,40 +752,28 @@ class Circuit:
             L_sub = sp.zeros(n_L, n_L)
             local_to_global = {i: k for i, k in enumerate(L_indices)}
 
-            all_numeric = True
             for i in range(n_L):
                 k_i = local_to_global[i]
-                val_i = edge_map[k_i]['value']
-                if isinstance(val_i, sp.Basic) and val_i.free_symbols:
-                    all_numeric = False
-                L_sub[i, i] = val_i
+                L_sub[i, i] = edge_map[k_i]['value']
                 for j in range(i + 1, n_L):
                     k_j = local_to_global[j]
                     key_tuple = tuple(sorted((k_i, k_j)))
                     if key_tuple in mutual_dict:
                         val_ij = mutual_dict[key_tuple]
-                        if isinstance(val_ij, sp.Basic) and val_ij.free_symbols:
-                            all_numeric = False
                         L_sub[i, j] = val_ij
                         L_sub[j, i] = val_ij
 
-            if all_numeric:
-                # 使用 NumPy 求逆，结果转为 SymPy 矩阵保持接口一致
-                L_sub_np = np.array(L_sub).astype(float)   # 假设所有值可转为 float
-                Gamma_sub_np = np.linalg.inv(L_sub_np)
-                Gamma_sub = sp.Matrix(Gamma_sub_np.tolist())
-            else:
-                try:
-                    Gamma_sub = L_sub.inv()
-                except ValueError:
-                    raise ValueError("电感矩阵奇异，无法求逆。请检查互感参数或电路拓扑。")
+            try:
+                Gamma_sub = L_sub.inv()
+            except ValueError:
+                raise ValueError("电感矩阵奇异，无法求逆。请检查互感参数或电路拓扑。")
 
             L_plus = sp.zeros(num_edges, num_edges)
             for i in range(n_L):
                 for j in range(n_L):
                     L_plus[local_to_global[i], local_to_global[j]] = Gamma_sub[i, j]
 
-        return D_C, L_plus, D_J
+        return (D_C, L_plus, D_J)
 
     # 公开属性 
 
@@ -949,6 +1033,8 @@ class Circuit:
                 - D_J:        约瑟夫森矩阵
         '''
         self._ensure_built()
+        if self._hamiltonian_cache is not None:
+            return self._hamiltonian_cache
         F_C = self.F_C
         D_C, L_plus, D_J = self._build_parameter_matrices()
         external_fluxes = self._compute_external_fluxes()
@@ -981,32 +1067,18 @@ class Circuit:
 
         # 4. 动能: H_kin = ½ q^T M^{-1} q
         if not D_C.free_symbols:
-            # 将 F_C 和 D_C 转换为 NumPy 数组
+            # D_C 为纯数值: 使用 NumPy 计算 M 及其逆
             F_C_np = np.array(F_C).astype(int)      # F_C 元素为 -1,0,1
-            D_C_np = np.diag(np.array(D_C).astype(float))
-            M_np = F_C_np @ D_C_np @ F_C_np.T
-            M = sp.Matrix(M_np.tolist())
+            Dc_diag = np.array([float(D_C[i, i]) for i in range(m)])
+            M_np = F_C_np @ np.diag(Dc_diag) @ F_C_np.T
+            try:
+                M_inv_np = np.linalg.inv(M_np)
+                M = sp.nsimplify(sp.Matrix(M_np.tolist()))
+                M_inv = sp.nsimplify(sp.Matrix(M_inv_np.tolist()))
+            except np.linalg.LinAlgError:
+                raise ValueError("质量矩阵 M = F_C·D_C·F_C^T 奇异，无法求逆。请检查电容参数。")
         else:
             M = F_C * D_C * F_C.T
-        
-        # 判断 M 是否为纯数值矩阵（不含符号）
-        if not M.free_symbols:  # free_symbols 返回矩阵中所有自由符号的集合
-            try:
-                # 转换为 NumPy 数组（float 类型）
-                M_np = np.array(M).astype(float)
-                # 使用 NumPy 求逆
-                M_inv_np = np.linalg.inv(M_np)
-                # 转回 SymPy 矩阵
-                M_inv = sp.Matrix(M_inv_np.tolist())
-            except (np.linalg.LinAlgError, ValueError) as e:
-                # 如果数值求逆失败（如奇异矩阵），回退到符号求逆并给出警告
-                import warnings
-                warnings.warn(
-                    f"NumPy 数值求逆失败 ({e})，回退到 SymPy 符号求逆。",
-                    RuntimeWarning, stacklevel=2
-                )
-                M_inv = M.inv()
-        else:
             try:
                 M_inv = M.inv()
             except ValueError:
@@ -1014,15 +1086,23 @@ class Circuit:
         H_kin = (sp.Rational(1, 2) * q_t.T * M_inv * q_t)[0]
 
         # 5. 电感势能: H_L = ½ Phi^T L_plus Phi
-        H_mag_lin = (sp.Rational(1, 2) * Phi_vec.T * L_plus * Phi_vec)[0]
+        #    L_plus 通常稀疏（只有电感位置非零），只对非零元素做符号求和
+        if not L_plus.free_symbols:
+            L_plus_np = np.array(L_plus).astype(float)
+            nz_pairs = np.argwhere(L_plus_np != 0)
+            H_mag_lin = sp.S.Zero
+            for i, j in nz_pairs:
+                H_mag_lin += sp.nsimplify(L_plus_np[i, j]) * Phi_vec[i] * Phi_vec[j]
+            H_mag_lin = sp.Rational(1, 2) * H_mag_lin
+        else:
+            H_mag_lin = (sp.Rational(1, 2) * Phi_vec.T * L_plus * Phi_vec)[0]
 
         # 6. 约瑟夫森势能: H_JJ = -Σ Ej cos(Phi_k)
-        H_jj = 0
+        H_jj = sp.S.Zero
         for k in range(m):
             coeff = D_J[k, k]
             if coeff != 0:
-                phi_k = Phi_vec[k]
-                H_jj -= coeff * sp.cos(phi_k)
+                H_jj -= coeff * sp.cos(Phi_vec[k])
 
         H_total = H_kin + H_mag_lin + H_jj
 
@@ -1038,8 +1118,9 @@ class Circuit:
             'D_J': D_J,
         }
 
-        return H_total, info
-    
+        self._hamiltonian_cache = (H_total, info)
+        return self._hamiltonian_cache
+
     def hamiltonian_symbols(self):
         """
         返回哈密顿量表达式中涉及的符号分类信息。
@@ -1083,6 +1164,13 @@ class Circuit:
                 其中 param_vals 是按顺序排列的其他符号参数的值，
                 顺序可通过 `hamiltonian_symbols()[1]` 获取。
         """
+        # 将字符串 key 自动转为 Symbol，方便调用方直接传 {"C1": 1e-15} 形式
+        if parameters is not None:
+            parameters = {
+                sp.Symbol(k) if isinstance(k, str) else k: v
+                for k, v in parameters.items()
+            }
+
         H, info = self.hamiltonian()
         phi_vars = list(info['phi_t'])
         q_vars = list(info['q_t'])
